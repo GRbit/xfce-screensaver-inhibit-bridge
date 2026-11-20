@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""Bridge org.freedesktop.ScreenSaver inhibits to xfce4-power-manager.
+
+Apps (e.g. Jellyfin Media Player) inhibit the screensaver through
+org.freedesktop.ScreenSaver, which light-locker owns and which only suspends
+the X screensaver. Backlight dimming and idle suspend are done by
+xfce4-power-manager, which only honors org.freedesktop.PowerManagement.Inhibit.
+This daemon watches ScreenSaver Inhibit/UnInhibit traffic as a bus monitor and
+holds one inhibit at xfpm while at least one app holds a ScreenSaver inhibit.
+
+Known limitation: inhibits taken before the bridge started are invisible to
+it, because light-locker has no API to list them. They are picked up only
+after the app releases and re-inhibits (e.g. pause and resume playback).
+
+Usage:
+  screensaver-inhibit-bridge [--debug]
+  screensaver-inhibit-bridge --self-test
+"""
+
+import argparse
+import enum
+import logging
+import sys
+import unittest
+from typing import Dict, NamedTuple, Optional, Tuple
+
+log = logging.getLogger("screensaver-inhibit-bridge")
+
+BRIDGE_APP_NAME = "screensaver-inhibit-bridge"
+
+
+# ---------------------------------------------------------------------------
+# Pure state machine. No D-Bus imports here, so --self-test runs anywhere.
+# ---------------------------------------------------------------------------
+
+class Upstream(enum.Enum):
+    IDLE = "idle"        # no inhibit held at xfpm
+    HOLDING = "holding"  # we hold exactly one xfpm inhibit (cookie stored)
+
+
+class Action(enum.Enum):
+    NONE = "none"
+    ACQUIRE = "acquire"
+    RELEASE = "release"
+
+
+class Decision(NamedTuple):
+    action: Action
+    # App/reason that triggered the decision, for logging only.
+    app: str = ""
+    reason: str = ""
+    # Upstream cookie to release (RELEASE only).
+    cookie: Optional[int] = None
+
+
+NOTHING = Decision(Action.NONE)
+
+
+class InhibitTracker:
+    """Tracks downstream ScreenSaver inhibits and the single upstream one.
+
+    Every event method returns a Decision. The caller performs it and reports
+    the outcome via acquired() / acquire_failed() / released(), which are the
+    only ways the upstream state changes besides xfpm owner changes.
+    """
+
+    def __init__(self) -> None:
+        self.upstream = Upstream.IDLE
+        self.upstream_cookie: Optional[int] = None
+        # Unique name of the current xfpm, "" when absent.
+        self.upstream_owner = ""
+        # (caller, call serial) -> (app, reason), waiting for the reply cookie.
+        self.pending: Dict[Tuple[str, int], Tuple[str, str]] = {}
+        # (caller, cookie) -> (app, reason). Cookies are scoped per caller
+        # because UnInhibit is only honored from the connection that inhibited.
+        self.active: Dict[Tuple[str, int], Tuple[str, str]] = {}
+        self._last_removed: Tuple[str, str] = ("", "")
+
+    # -- downstream events --------------------------------------------------
+
+    def on_inhibit_call(self, caller: str, serial: int, app: str, reason: str) -> Decision:
+        # xfpm forwards every inhibit it holds (ours included) to
+        # org.freedesktop.ScreenSaver via libxfce4ui. Mirroring that back
+        # makes an acquire/release feedback loop, so its calls are ignored.
+        if self.upstream_owner and caller == self.upstream_owner:
+            return NOTHING
+        self.pending[(caller, serial)] = (app, reason)
+        return NOTHING
+
+    def on_method_return(self, destination: str, reply_serial: int,
+                         cookie: Optional[int]) -> Decision:
+        entry = self.pending.pop((destination, reply_serial), None)
+        if entry is None or cookie is None:
+            return NOTHING
+        self.active[(destination, cookie)] = entry
+        return self._reconcile()
+
+    def on_error(self, destination: str, reply_serial: int) -> Decision:
+        self.pending.pop((destination, reply_serial), None)
+        return NOTHING
+
+    def on_uninhibit_call(self, caller: str, cookie: int) -> Decision:
+        entry = self.active.pop((caller, cookie), None)
+        if entry is None:
+            return NOTHING
+        self._last_removed = entry
+        return self._reconcile()
+
+    def on_name_vanished(self, unique_name: str) -> Decision:
+        for key in [k for k in self.pending if k[0] == unique_name]:
+            del self.pending[key]
+        gone = [k for k in self.active if k[0] == unique_name]
+        if not gone:
+            return NOTHING
+        self._last_removed = self.active[gone[-1]]
+        for key in gone:
+            del self.active[key]
+        return self._reconcile()
+
+    def on_screensaver_owner_changed(self) -> Decision:
+        # The new (or no) owner knows nothing of the old owner's inhibits.
+        self.pending.clear()
+        if self.active:
+            self._last_removed = ("org.freedesktop.ScreenSaver", "owner changed")
+        self.active.clear()
+        return self._reconcile()
+
+    # -- upstream events ----------------------------------------------------
+
+    def on_upstream_owner_changed(self, new_owner: str) -> Decision:
+        # Any owner change kills our cookie: xfpm drops inhibits of vanished
+        # callers, and a new instance never saw ours.
+        self.upstream = Upstream.IDLE
+        self.upstream_cookie = None
+        self.upstream_owner = new_owner
+        return self._reconcile()
+
+    def acquired(self, cookie: int) -> None:
+        self.upstream = Upstream.HOLDING
+        self.upstream_cookie = cookie
+
+    def acquire_failed(self) -> None:
+        # Stay IDLE; the next downstream event or xfpm appearing retries.
+        self.upstream = Upstream.IDLE
+        self.upstream_cookie = None
+
+    def released(self) -> None:
+        # Even if the UnInhibit call failed there is nothing better to do;
+        # xfpm drops it anyway once our connection goes away.
+        self.upstream = Upstream.IDLE
+        self.upstream_cookie = None
+
+    # -- core ---------------------------------------------------------------
+
+    def _reconcile(self) -> Decision:
+        want = bool(self.active)
+        if want and self.upstream is Upstream.IDLE and self.upstream_owner:
+            app, reason = next(reversed(self.active.values()))
+            return Decision(Action.ACQUIRE, app, reason)
+        if not want and self.upstream is Upstream.HOLDING:
+            app, reason = self._last_removed
+            return Decision(Action.RELEASE, app, reason, self.upstream_cookie)
+        return NOTHING
+
+
+# ---------------------------------------------------------------------------
+# Self-test
+# ---------------------------------------------------------------------------
+
+class TrackerTest(unittest.TestCase):
+    A = ":1.10"
+    B = ":1.11"
+
+    def setUp(self) -> None:
+        self.t = InhibitTracker()
+        self.t.on_upstream_owner_changed(":1.99")
+
+    def inhibit(self, caller: str, serial: int, cookie: int, app: str = "app") -> Decision:
+        self.assertEqual(self.t.on_inhibit_call(caller, serial, app, "video"), NOTHING)
+        return self.t.on_method_return(caller, serial, cookie)
+
+    def apply(self, d: Decision, cookie: int = 500) -> None:
+        if d.action is Action.ACQUIRE:
+            self.t.acquired(cookie)
+        elif d.action is Action.RELEASE:
+            self.t.released()
+
+    def test_inhibit_uninhibit(self) -> None:
+        d = self.inhibit(self.A, 5, 42, "jmp")
+        self.assertEqual(d, Decision(Action.ACQUIRE, "jmp", "video"))
+        self.apply(d)
+        self.assertIs(self.t.upstream, Upstream.HOLDING)
+        d = self.t.on_uninhibit_call(self.A, 42)
+        self.assertEqual(d, Decision(Action.RELEASE, "jmp", "video", 500))
+        self.apply(d)
+        self.assertIs(self.t.upstream, Upstream.IDLE)
+
+    def test_two_apps_overlapping(self) -> None:
+        self.apply(self.inhibit(self.A, 5, 1, "a"))
+        self.assertEqual(self.inhibit(self.B, 7, 2, "b").action, Action.NONE)
+        self.assertEqual(self.t.on_uninhibit_call(self.A, 1).action, Action.NONE)
+        d = self.t.on_uninhibit_call(self.B, 2)
+        self.assertEqual(d.action, Action.RELEASE)
+        self.assertEqual(d.app, "b")
+
+    def test_same_app_two_cookies(self) -> None:
+        self.apply(self.inhibit(self.A, 5, 1))
+        self.assertEqual(self.inhibit(self.A, 6, 2).action, Action.NONE)
+        self.assertEqual(self.t.on_uninhibit_call(self.A, 2).action, Action.NONE)
+        self.assertEqual(self.t.on_uninhibit_call(self.A, 1).action, Action.RELEASE)
+
+    def test_sender_disconnect_without_uninhibit(self) -> None:
+        self.apply(self.inhibit(self.A, 5, 1))
+        self.apply(self.inhibit(self.A, 6, 2))
+        self.t.on_inhibit_call(self.A, 9, "app", "never answered")
+        d = self.t.on_name_vanished(self.A)
+        self.assertEqual(d.action, Action.RELEASE)
+        self.assertEqual(self.t.active, {})
+        self.assertEqual(self.t.pending, {})
+
+    def test_disconnect_of_other_sender_keeps_hold(self) -> None:
+        self.apply(self.inhibit(self.A, 5, 1))
+        self.assertEqual(self.t.on_name_vanished(self.B), NOTHING)
+        self.assertEqual(len(self.t.active), 1)
+
+    def test_error_reply(self) -> None:
+        self.t.on_inhibit_call(self.A, 5, "app", "video")
+        self.assertEqual(self.t.on_error(self.A, 5), NOTHING)
+        self.assertEqual(self.t.pending, {})
+        # A late return for the cancelled call must not resurrect it.
+        self.assertEqual(self.t.on_method_return(self.A, 5, 1), NOTHING)
+        self.assertEqual(self.t.active, {})
+
+    def test_return_for_unrelated_call_ignored(self) -> None:
+        self.t.on_inhibit_call(self.A, 5, "app", "video")
+        self.assertEqual(self.t.on_method_return(self.B, 5, 1), NOTHING)
+        self.assertEqual(self.t.on_method_return(self.A, 6, 1), NOTHING)
+        self.assertEqual(len(self.t.pending), 1)
+
+    def test_return_without_cookie_drops_pending(self) -> None:
+        self.t.on_inhibit_call(self.A, 5, "app", "video")
+        self.assertEqual(self.t.on_method_return(self.A, 5, None), NOTHING)
+        self.assertEqual(self.t.pending, {})
+
+    def test_uninhibit_unknown_cookie(self) -> None:
+        self.apply(self.inhibit(self.A, 5, 1))
+        self.assertEqual(self.t.on_uninhibit_call(self.A, 999), NOTHING)
+        # Right cookie, wrong sender: not ours to remove.
+        self.assertEqual(self.t.on_uninhibit_call(self.B, 1), NOTHING)
+        self.assertIs(self.t.upstream, Upstream.HOLDING)
+
+    def test_screensaver_owner_change(self) -> None:
+        self.apply(self.inhibit(self.A, 5, 1))
+        self.apply(self.inhibit(self.B, 6, 2))
+        self.t.on_inhibit_call(self.A, 7, "app", "video")
+        d = self.t.on_screensaver_owner_changed()
+        self.assertEqual(d.action, Action.RELEASE)
+        self.assertEqual(self.t.pending, {})
+        self.assertEqual(self.t.active, {})
+
+    def test_xfpm_restart_while_holding(self) -> None:
+        self.apply(self.inhibit(self.A, 5, 1, "jmp"), cookie=500)
+        self.assertEqual(self.t.on_upstream_owner_changed(""), NOTHING)
+        self.assertIs(self.t.upstream, Upstream.IDLE)
+        d = self.t.on_upstream_owner_changed(":1.200")
+        self.assertEqual(d, Decision(Action.ACQUIRE, "jmp", "video"))
+        self.apply(d, cookie=7)
+        self.assertEqual(self.t.upstream_cookie, 7)
+        # Release must use the new cookie, not the dead one.
+        self.assertEqual(self.t.on_uninhibit_call(self.A, 1).cookie, 7)
+
+    def test_xfpm_replaced_in_one_step(self) -> None:
+        self.apply(self.inhibit(self.A, 5, 1))
+        self.assertEqual(self.t.on_upstream_owner_changed(":1.201").action, Action.ACQUIRE)
+
+    def test_xfpm_absent_then_appears(self) -> None:
+        self.t.on_upstream_owner_changed("")
+        self.assertEqual(self.inhibit(self.A, 5, 1).action, Action.NONE)
+        self.assertEqual(self.t.on_upstream_owner_changed(":1.300").action, Action.ACQUIRE)
+
+    def test_inhibit_echoed_by_xfpm_ignored(self) -> None:
+        self.apply(self.inhibit(self.A, 5, 1))
+        # xfpm (:1.99, see setUp) forwards our upstream inhibit to ScreenSaver.
+        self.assertEqual(self.inhibit(":1.99", 3, 2, "libxfce4ui").action, Action.NONE)
+        self.assertEqual(self.t.pending, {})
+        self.assertEqual(self.t.on_uninhibit_call(self.A, 1).action, Action.RELEASE)
+
+    def test_acquire_failed_retries_on_next_event(self) -> None:
+        self.assertEqual(self.inhibit(self.A, 5, 1).action, Action.ACQUIRE)
+        self.t.acquire_failed()
+        self.assertEqual(self.inhibit(self.A, 6, 2).action, Action.ACQUIRE)
+
+
+def self_test() -> int:
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TrackerTest)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+# ---------------------------------------------------------------------------
+# D-Bus glue
+# ---------------------------------------------------------------------------
+
+SS_NAME = "org.freedesktop.ScreenSaver"
+SS_IFACE = "org.freedesktop.ScreenSaver"
+PM_NAME = "org.freedesktop.PowerManagement"
+PM_PATH = "/org/freedesktop/PowerManagement/Inhibit"
+PM_IFACE = "org.freedesktop.PowerManagement.Inhibit"
+DBUS_NAME = "org.freedesktop.DBus"
+CALL_TIMEOUT_MS = 5000
+
+# No path in the call rules: JMP uses /org/freedesktop/ScreenSaver, others
+# /ScreenSaver. sender=<well-known> makes dbus-daemon match replies from the
+# current owner of that name, so we do not have to see every reply on the bus.
+# Errors from the bus itself cover "no owner" (ServiceUnknown).
+MONITOR_RULES = [
+    f"type='method_call',interface='{SS_IFACE}',member='Inhibit'",
+    f"type='method_call',interface='{SS_IFACE}',member='UnInhibit'",
+    f"type='method_return',sender='{SS_NAME}'",
+    f"type='error',sender='{SS_NAME}'",
+    f"type='error',sender='{DBUS_NAME}'",
+    f"type='signal',sender='{DBUS_NAME}',interface='{DBUS_NAME}',member='NameOwnerChanged'",
+]
+
+
+class Bridge:
+    def __init__(self, Gio, GLib) -> None:
+        self.Gio = Gio
+        self.GLib = GLib
+        self.tracker = InhibitTracker()
+        self.loop = GLib.MainLoop()
+        self.exit_code = 0
+        address = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
+        flags = (Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                 | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION)
+        # Private connections instead of Gio.bus_get_sync: the shared one has
+        # exit_on_close=True, which raises SIGTERM, and systemd treats that as
+        # a clean exit, so Restart=on-failure would not kick in.
+        self.conn = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
+        self.mon = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
+        self._monitoring = False
+        self._become_serial = -1
+        self.conn.connect("closed", self._on_closed)
+        self.mon.connect("closed", self._on_closed)
+
+    def _on_closed(self, _conn, remote_peer_vanished, error) -> None:
+        log.error("bus connection closed (remote_vanished=%s, error=%s)",
+                  remote_peer_vanished, error)
+        self.exit_code = 1
+        self.loop.quit()
+
+    def _name_owner(self, name: str) -> str:
+        try:
+            reply = self.conn.call_sync(
+                DBUS_NAME, "/org/freedesktop/DBus", DBUS_NAME, "GetNameOwner",
+                self.GLib.Variant("(s)", (name,)), self.GLib.VariantType("(s)"),
+                self.Gio.DBusCallFlags.NONE, CALL_TIMEOUT_MS, None)
+            return reply.unpack()[0]
+        except self.GLib.Error:
+            return ""
+
+    def start(self) -> None:
+        # Filter before BecomeMonitor so no monitored message reaches GDBus
+        # dispatch between the reply and filter installation.
+        self.mon.add_filter(self._filter)
+        self.mon.call_sync(
+            DBUS_NAME, "/org/freedesktop/DBus", "org.freedesktop.DBus.Monitoring",
+            "BecomeMonitor", self.GLib.Variant("(asu)", (MONITOR_RULES, 0)),
+            None, self.Gio.DBusCallFlags.NONE, CALL_TIMEOUT_MS, None)
+        # Owners are queried after monitoring starts, so a change racing with
+        # startup is seen as a NameOwnerChanged rather than lost.
+        pm_owner = self._name_owner(PM_NAME)
+        ss_owner = self._name_owner(SS_NAME)
+        log.info("started: monitoring %s (owner %s), upstream %s (owner %s)",
+                 SS_NAME, ss_owner or "none", PM_NAME, pm_owner or "none")
+        self._perform(self.tracker.on_upstream_owner_changed(pm_owner))
+
+    def _filter(self, _conn, message, incoming):
+        # Runs in GDBus's worker thread. Extract plain values here and hand
+        # them to the main loop in order.
+        #
+        # The BecomeMonitor reply itself must pass through, or call_sync
+        # never returns. The bus sends that reply before any monitored
+        # message, so it marks the switch from "pass all" to "swallow all".
+        if not self._monitoring:
+            if not incoming:
+                if message.get_member() == "BecomeMonitor":
+                    self._become_serial = message.get_serial()
+            elif (message.get_message_type() in (self.Gio.DBusMessageType.METHOD_RETURN,
+                                                 self.Gio.DBusMessageType.ERROR)
+                  and message.get_reply_serial() == self._become_serial):
+                self._monitoring = True
+            return message
+        if incoming:
+            try:
+                event = self._extract(message)
+            except Exception:  # never let a parse problem kill the worker
+                log.exception("failed to parse message")
+                event = None
+            if event is not None:
+                self.GLib.idle_add(self._dispatch, event)
+        # Always swallow: a monitor must never send, and letting GDBus dispatch
+        # these would make it auto-reply UnknownMethod, which gets the monitor
+        # disconnected by the bus.
+        return None
+
+    def _extract(self, message):
+        Gio = self.Gio
+        mtype = message.get_message_type()
+        body = message.get_body()
+        sig = body.get_type_string() if body is not None else "()"
+        if mtype == Gio.DBusMessageType.METHOD_CALL:
+            member = message.get_member()
+            if message.get_interface() != SS_IFACE:
+                return None
+            if member == "Inhibit" and sig == "(ss)":
+                app, reason = body.unpack()
+                return ("inhibit", message.get_sender(), message.get_serial(),
+                        app, reason, message.get_destination(), message.get_path())
+            if member == "UnInhibit" and sig == "(u)":
+                return ("uninhibit", message.get_sender(), body.unpack()[0])
+            return None
+        if mtype == Gio.DBusMessageType.METHOD_RETURN:
+            cookie = body.unpack()[0] if sig == "(u)" else None
+            return ("return", message.get_destination(), message.get_reply_serial(), cookie)
+        if mtype == Gio.DBusMessageType.ERROR:
+            return ("error", message.get_destination(), message.get_reply_serial(),
+                    message.get_error_name())
+        if mtype == Gio.DBusMessageType.SIGNAL and message.get_member() == "NameOwnerChanged":
+            if sig != "(sss)":
+                return None
+            return ("owner",) + tuple(body.unpack())
+        return None
+
+    def _dispatch(self, event) -> bool:
+        kind = event[0]
+        t = self.tracker
+        if kind == "inhibit":
+            _, sender, serial, app, reason, dest, path = event
+            log.debug("Inhibit call from %s serial=%d app=%r reason=%r -> %s %s",
+                      sender, serial, app, reason, dest, path)
+            d = t.on_inhibit_call(sender, serial, app, reason)
+        elif kind == "uninhibit":
+            _, sender, cookie = event
+            log.debug("UnInhibit call from %s cookie=%d", sender, cookie)
+            d = t.on_uninhibit_call(sender, cookie)
+        elif kind == "return":
+            _, dest, reply_serial, cookie = event
+            if (dest, reply_serial) in t.pending:
+                log.debug("Inhibit reply to %s serial=%d cookie=%s", dest, reply_serial, cookie)
+            d = t.on_method_return(dest, reply_serial, cookie)
+        elif kind == "error":
+            _, dest, reply_serial, name = event
+            if (dest, reply_serial) in t.pending:
+                log.debug("Inhibit error to %s serial=%d: %s", dest, reply_serial, name)
+            d = t.on_error(dest, reply_serial)
+        elif kind == "owner":
+            _, name, old, new = event
+            if name == SS_NAME:
+                log.info("%s owner changed %r -> %r, dropping all tracked inhibits",
+                         SS_NAME, old, new)
+                d = t.on_screensaver_owner_changed()
+            elif name == PM_NAME:
+                log.info("%s owner changed %r -> %r", PM_NAME, old, new)
+                d = t.on_upstream_owner_changed(new)
+            elif name.startswith(":") and not new:
+                if any(k[0] == name for k in list(t.active) + list(t.pending)):
+                    log.debug("%s left the bus, dropping its inhibits", name)
+                d = t.on_name_vanished(name)
+            else:
+                d = NOTHING
+        else:
+            d = NOTHING
+        self._perform(d)
+        log.debug("state: upstream=%s active=%d pending=%d",
+                  t.upstream.value, len(t.active), len(t.pending))
+        return False  # one-shot idle callback
+
+    def _perform(self, d: Decision) -> None:
+        # Synchronous calls keep the state machine free of an ACQUIRING state;
+        # monitor events queue up in the main loop meanwhile and are not lost.
+        GLib, Gio = self.GLib, self.Gio
+        if d.action is Action.ACQUIRE:
+            try:
+                reply = self.conn.call_sync(
+                    PM_NAME, PM_PATH, PM_IFACE, "Inhibit",
+                    GLib.Variant("(ss)", (BRIDGE_APP_NAME, f"{d.app}: {d.reason}")),
+                    GLib.VariantType("(u)"), Gio.DBusCallFlags.NO_AUTO_START,
+                    CALL_TIMEOUT_MS, None)
+            except GLib.Error as e:
+                log.warning("upstream acquire failed (for %s: %s): %s", d.app, d.reason, e.message)
+                self.tracker.acquire_failed()
+                return
+            cookie = reply.unpack()[0]
+            self.tracker.acquired(cookie)
+            log.info("upstream inhibit acquired for app=%r reason=%r (xfpm cookie %d)",
+                     d.app, d.reason, cookie)
+        elif d.action is Action.RELEASE:
+            try:
+                self.conn.call_sync(
+                    PM_NAME, PM_PATH, PM_IFACE, "UnInhibit",
+                    GLib.Variant("(u)", (d.cookie,)), None,
+                    Gio.DBusCallFlags.NO_AUTO_START, CALL_TIMEOUT_MS, None)
+                log.info("upstream inhibit released, last app=%r reason=%r (xfpm cookie %d)",
+                         d.app, d.reason, d.cookie)
+            except GLib.Error as e:
+                log.warning("upstream release of cookie %d failed: %s", d.cookie, e.message)
+            self.tracker.released()
+
+    def _on_signal(self) -> bool:
+        log.info("terminating")
+        self.loop.quit()
+        return False
+
+    def run(self) -> int:
+        self.start()
+        for sig in (2, 15):  # SIGINT, SIGTERM
+            self.GLib.unix_signal_add(self.GLib.PRIORITY_HIGH, sig, self._on_signal)
+        self.loop.run()
+        if self.tracker.upstream is Upstream.HOLDING and self.exit_code == 0:
+            self._perform(Decision(Action.RELEASE, "bridge", "shutdown",
+                                   self.tracker.upstream_cookie))
+        return self.exit_code
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--debug", action="store_true", help="log every observed call")
+    parser.add_argument("--self-test", action="store_true", help="run unit tests and exit")
+    args = parser.parse_args()
+
+    if args.self_test:
+        return self_test()
+
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.DEBUG if args.debug else logging.INFO,
+        # journald adds timestamps itself.
+        format="%(levelname)s %(message)s",
+    )
+
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+
+    return Bridge(Gio, GLib).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

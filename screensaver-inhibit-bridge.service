@@ -1,0 +1,15 @@
+[Unit]
+Description=Bridge org.freedesktop.ScreenSaver inhibits to xfce4-power-manager
+# The XFCE session is not systemd-managed, so graphical-session.target never
+# becomes active here; default.target plus the user bus socket is enough,
+# the bridge waits for light-locker and xfpm to appear on the bus.
+After=dbus.socket
+Requires=dbus.socket
+
+[Service]
+ExecStart=%h/.local/bin/screensaver-inhibit-bridge
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
